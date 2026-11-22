@@ -11,6 +11,7 @@ PC3.ScrollView {
 
     property string editId: ""
     property string status: ""
+    readonly property var kinds: ["daily", "every", "once", "doses"]
     readonly property var dayKeys: ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
     readonly property var busyKeys: ["gaming", "watching", "focus", "chatting", "browsing"]
     property var days: []
@@ -33,12 +34,16 @@ PC3.ScrollView {
         editId = r ? String(r.id) : ""
         title.text = r ? r.title : ""
         body.text = r ? r.body : ""
-        kind.currentIndex = ["daily", "every", "once"].indexOf(s.kind)
+        kind.currentIndex = editor.kinds.indexOf(s.kind)
         times.text = s.kind === "daily" ? s.times.map(hm).join(", ") : "09:00"
         every.value = s.kind === "every" ? s.minutes : 60
         from.text = s.kind === "every" ? hm(s.start) : "09:00"
         to.text = s.kind === "every" ? hm(s.end) : "22:00"
         at.text = s.kind === "once" ? String(s.at).slice(0, 16) : Qt.formatDateTime(new Date(Date.now() + 3600000), "yyyy-MM-dd'T'HH:00")
+        doseEvery.value = s.kind === "doses" ? s.every_min : 360
+        doseGap.value = s.kind === "doses" ? s.min_gap_min : 240
+        doseMax.value = s.kind === "doses" ? s.max_per_day : 0
+        pause.checked = !!p.pause_when_away
         days = s.days || []
         hold.currentIndex = p.hold === "never" ? 1 : 0
         busy = p.busy
@@ -51,17 +56,19 @@ PC3.ScrollView {
     }
 
     function spec() {
-        const k = ["daily", "every", "once"][kind.currentIndex]
+        const k = editor.kinds[kind.currentIndex]
         let schedule
         if (k === "daily") schedule = { kind: k, times: times.text.split(",").map(t => t.trim()).filter(t => t), days: days }
         else if (k === "every") schedule = { kind: k, minutes: every.value, start: from.text.trim(), end: to.text.trim(), days: days }
+        else if (k === "doses") schedule = { kind: k, every_min: doseEvery.value, min_gap_min: doseGap.value, max_per_day: doseMax.value }
         else schedule = { kind: k, at: at.text.trim() }
         return {
             title: title.text, body: body.text, schedule: schedule, enabled: enabled.checked,
             policy: {
                 hold: hold.currentIndex === 1 ? "never" : "when_busy", busy: busy,
                 max_defer_min: maxDefer.value, repeat_every_min: repeat.value,
-                max_repeats: maxRepeats.value, escalate_after: escalate.value, ring_phone: ring.checked
+                max_repeats: maxRepeats.value, escalate_after: escalate.value, ring_phone: ring.checked,
+                pause_when_away: pause.checked, keep_open: k === "doses"
             }
         }
     }
@@ -87,7 +94,16 @@ PC3.ScrollView {
 
         Kirigami.Separator { Kirigami.FormData.isSection: true; Kirigami.FormData.label: "When" }
 
-        PC3.ComboBox { id: kind; Kirigami.FormData.label: "Repeats:"; model: ["Daily at times", "Every N minutes", "Once"] }
+        PC3.ComboBox {
+            id: kind
+            Kirigami.FormData.label: "Repeats:"
+            model: ["Daily at times", "Every N minutes", "Once", "Medicine (spaced from last dose)"]
+            onActivated: index => {
+                if (index !== 3 || editor.editId !== "") return
+                hold.currentIndex = 1
+                pause.checked = true
+            }
+        }
         PC3.TextField {
             id: times
             visible: kind.currentIndex === 0
@@ -109,7 +125,7 @@ PC3.ScrollView {
             placeholderText: "2026-11-23T15:00"
         }
         Flow {
-            visible: kind.currentIndex !== 2
+            visible: kind.currentIndex < 2
             Kirigami.FormData.label: "Days:"
             Layout.fillWidth: true
             Repeater {
@@ -123,8 +139,38 @@ PC3.ScrollView {
             }
         }
         PC3.Label {
-            visible: kind.currentIndex !== 2
+            visible: kind.currentIndex < 2
             text: "No days ticked means every day."
+            opacity: 0.6
+            font: Kirigami.Theme.smallFont
+        }
+
+        PC3.SpinBox {
+            id: doseEvery
+            visible: kind.currentIndex === 3
+            Kirigami.FormData.label: "Every:"
+            from: 15; to: 1440; stepSize: 15
+            textFromValue: (v, l) => editor.app.dur(v)
+        }
+        PC3.SpinBox {
+            id: doseGap
+            visible: kind.currentIndex === 3
+            Kirigami.FormData.label: "Never closer than:"
+            from: 0; to: doseEvery.value; stepSize: 15
+            textFromValue: (v, l) => editor.app.dur(v)
+        }
+        PC3.SpinBox {
+            id: doseMax
+            visible: kind.currentIndex === 3
+            Kirigami.FormData.label: "Max per 24 hours:"
+            from: 0; to: 48
+            textFromValue: (v, l) => v === 0 ? "no cap" : String(v)
+        }
+        PC3.Label {
+            visible: kind.currentIndex === 3
+            Layout.fillWidth: true
+            wrapMode: Text.Wrap
+            text: "Each dose is due this long after the one you actually took, so a late dose moves the rest later and the gaps stay even. A missed dose never expires."
             opacity: 0.6
             font: Kirigami.Theme.smallFont
         }
@@ -147,6 +193,7 @@ PC3.ScrollView {
             }
         }
         PC3.SpinBox { id: maxDefer; visible: hold.currentIndex === 0; Kirigami.FormData.label: "Hold at most (min):"; from: 0; to: 1440 }
+        PC3.CheckBox { id: pause; Kirigami.FormData.label: "Asleep or away:"; text: "Wait until I'm back (no phone)" }
 
         Kirigami.Separator { Kirigami.FormData.isSection: true; Kirigami.FormData.label: "If I ignore it" }
 

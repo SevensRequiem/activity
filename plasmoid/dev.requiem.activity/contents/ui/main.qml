@@ -14,6 +14,8 @@ PlasmoidItem {
     property var current: ({})
     property var reminders: []
     property var spans: []
+    property var doses: []
+    property var doseWarnings: []
     property bool online: false
     property bool editing: false
     property string error: ""
@@ -21,6 +23,7 @@ PlasmoidItem {
     readonly property string stateName: current.verdict ? current.verdict.state : "offline"
     readonly property var active: reminders.filter(r => r.phase && (r.phase.phase === "delivered" || r.phase.phase === "deferred"))
     readonly property var nextUp: reminders.filter(r => r.next && r.reminder.enabled).sort((a, b) => a.next - b.next)[0]
+    readonly property var medicines: reminders.filter(r => r.dose)
 
     readonly property var stateIcons: ({
         gaming: "input-gaming", watching: "video-television", focus: "document-edit",
@@ -55,7 +58,9 @@ PlasmoidItem {
     function refresh() {
         call("CurrentState", [], v => root.current = JSON.parse(v))
         call("ListReminders", [], v => root.reminders = JSON.parse(v))
-        if (root.expanded) call("Timeline", [""], v => root.spans = JSON.parse(v))
+        if (!root.expanded) return
+        call("Timeline", [""], v => root.spans = JSON.parse(v))
+        call("Doses", ["", "7"], v => root.doses = JSON.parse(v))
     }
 
     function clock(secs) {
@@ -66,9 +71,26 @@ PlasmoidItem {
         return d.toDateString() === today.toDateString() ? time : d.toLocaleDateString(Qt.locale(), "ddd d MMM") + " " + time
     }
 
+    function dur(min) {
+        const h = Math.floor(min / 60), m = min % 60
+        return h ? h + "h" + (m ? " " + m + "m" : "") : m + "m"
+    }
+
+    function ago(secs) {
+        return dur(Math.max(0, Math.round((Date.now() / 1000 - secs) / 60))) + " ago"
+    }
+
+    function takeDose(id, at) {
+        call("TakeDose", [String(id), at ? String(Math.round(at)) : ""], v => {
+            root.doseWarnings = JSON.parse(v)
+            root.refresh()
+        })
+    }
+
     function describe(s) {
         const days = s.days && s.days.length ? " (" + s.days.join(", ") + ")" : ""
         const hm = t => String(t).slice(0, 5)
+        if (s.kind === "doses") return "every " + dur(s.every_min) + " from the last dose" + (s.max_per_day ? ", max " + s.max_per_day + "/24h" : "")
         if (s.kind === "once") return "once at " + String(s.at).replace("T", " ").slice(0, 16)
         if (s.kind === "daily") return "daily at " + s.times.map(hm).join(", ") + days
         return "every " + s.minutes + " min, " + hm(s.start) + "–" + hm(s.end) + days
@@ -128,13 +150,14 @@ PlasmoidItem {
                 PC3.TabButton { text: "Now" }
                 PC3.TabButton { text: "Reminders" }
                 PC3.TabButton { text: "Today" }
+                PC3.TabButton { text: "Meds" }
             }
         }
 
         StackLayout {
             anchors.fill: parent
             anchors.margins: Kirigami.Units.smallSpacing
-            currentIndex: root.editing ? 3 : tabs.currentIndex
+            currentIndex: root.editing ? 4 : tabs.currentIndex
 
             NowPage { app: root }
             RemindersPage {
@@ -142,6 +165,7 @@ PlasmoidItem {
                 onEdit: entry => { editor.load(entry); root.editing = true }
             }
             TodayPage { app: root }
+            MedsPage { app: root }
             Editor {
                 id: editor
                 app: root

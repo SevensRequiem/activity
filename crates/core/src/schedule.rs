@@ -49,6 +49,15 @@ pub enum Schedule {
         #[serde(default)]
         days: Vec<Day>,
     },
+    /// Medicine: each dose is due `every_min` after the last one actually
+    /// taken, so spacing stays even whatever the clock says. The timing comes
+    /// from the dose log, see [`crate::dose`].
+    Doses {
+        every_min: u32,
+        min_gap_min: u32,
+        #[serde(default)]
+        max_per_day: u32,
+    },
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -61,6 +70,10 @@ pub enum Error {
     Window,
     #[error("a weekday is listed twice")]
     DuplicateDay,
+    #[error("minimum gap must not exceed the dose interval")]
+    MinGap,
+    #[error("at most {MAX_TIMES} doses per day")]
+    DoseCap,
 }
 
 const MAX_TIMES: usize = 48;
@@ -69,6 +82,22 @@ impl Schedule {
     pub fn validate(&self) -> Result<(), Error> {
         let days = match self {
             Schedule::Once { .. } => return Ok(()),
+            Schedule::Doses {
+                every_min,
+                min_gap_min,
+                max_per_day,
+            } => {
+                if !(1..=1440).contains(every_min) {
+                    return Err(Error::Interval);
+                }
+                if min_gap_min > every_min {
+                    return Err(Error::MinGap);
+                }
+                if usize::try_from(*max_per_day).map_or(true, |m| m > MAX_TIMES) {
+                    return Err(Error::DoseCap);
+                }
+                return Ok(());
+            }
             Schedule::Daily { times, days } => {
                 if times.is_empty() || times.len() > MAX_TIMES {
                     return Err(Error::TimeCount);
@@ -98,9 +127,27 @@ impl Schedule {
         Ok(())
     }
 
-    /// First fire time strictly after `after`, or `None` when the schedule is exhausted.
+    /// The dose rules when this is a medicine schedule.
+    pub fn doses(&self) -> Option<crate::dose::Rules> {
+        match *self {
+            Schedule::Doses {
+                every_min,
+                min_gap_min,
+                max_per_day,
+            } => Some(crate::dose::Rules {
+                every_min,
+                min_gap_min,
+                max_per_day,
+            }),
+            _ => None,
+        }
+    }
+
+    /// First fire time strictly after `after`, or `None` when the schedule is
+    /// exhausted. Always `None` for doses, whose timing needs the dose log.
     pub fn next_after(&self, after: Timestamp, tz: &TimeZone) -> Option<Timestamp> {
         let (times, days) = match self {
+            Schedule::Doses { .. } => return None,
             Schedule::Once { at } => {
                 let ts = at.to_zoned(tz.clone()).ok()?.timestamp();
                 return (ts > after).then_some(ts);
@@ -255,6 +302,21 @@ mod tests {
                 "duplicate day",
                 r#"{"kind":"daily","times":["09:00"],"days":["mon","mon"]}"#,
                 Err(Error::DuplicateDay),
+            ),
+            (
+                "doses",
+                r#"{"kind":"doses","every_min":360,"min_gap_min":240,"max_per_day":4}"#,
+                Ok(()),
+            ),
+            (
+                "dose gap over interval",
+                r#"{"kind":"doses","every_min":240,"min_gap_min":300}"#,
+                Err(Error::MinGap),
+            ),
+            (
+                "dose cap too high",
+                r#"{"kind":"doses","every_min":30,"min_gap_min":30,"max_per_day":49}"#,
+                Err(Error::DoseCap),
             ),
         ];
         for (name, json, want) in cases {

@@ -23,6 +23,12 @@ pub struct Policy {
     pub escalate_after: u32,
     /// Ring the phone on the final repeat.
     pub ring_phone: bool,
+    /// While away (asleep, locked), wait instead of going to the phone, and
+    /// deliver on return.
+    pub pause_when_away: bool,
+    /// Never expire. After the last repeat it stays open, quietly, until
+    /// resolved. Medicine needs this: a missed dose is still owed.
+    pub keep_open: bool,
 }
 
 impl Default for Policy {
@@ -35,6 +41,8 @@ impl Default for Policy {
             max_repeats: 3,
             escalate_after: 3,
             ring_phone: false,
+            pause_when_away: false,
+            keep_open: false,
         }
     }
 }
@@ -105,6 +113,7 @@ pub struct Step {
 pub fn step(due: i64, phase: Phase, policy: &Policy, state: State, now: i64, grace: i64) -> Step {
     let busy = policy.hold == Hold::WhenBusy && policy.busy.contains(&state);
     let away = state == State::Away;
+    let paused = policy.pause_when_away && away;
     let mins = |m: u32| i64::from(m) * 60;
     let stay = |wake| Step {
         phase,
@@ -123,8 +132,13 @@ pub fn step(due: i64, phase: Phase, policy: &Policy, state: State, now: i64, gra
     };
     match phase {
         Phase::Pending if now < due => stay(Some(due)),
-        Phase::Pending if now > due + grace => Step {
+        Phase::Pending if now > due + grace && !policy.keep_open => Step {
             phase: Phase::Expired,
+            deliver: None,
+            wake: None,
+        },
+        Phase::Pending if paused => Step {
+            phase: Phase::Deferred { since: now },
             deliver: None,
             wake: None,
         },
@@ -135,6 +149,9 @@ pub fn step(due: i64, phase: Phase, policy: &Policy, state: State, now: i64, gra
         },
         Phase::Pending => deliver(1),
         Phase::Deferred { since } => {
+            if paused {
+                return stay(None);
+            }
             let limit = since + mins(policy.max_defer_min);
             if busy && !away && now < limit {
                 stay(Some(limit))
@@ -149,6 +166,12 @@ pub fn step(due: i64, phase: Phase, policy: &Policy, state: State, now: i64, gra
             let next = last + mins(policy.repeat_every_min);
             if now < next {
                 return stay(Some(next));
+            }
+            if paused {
+                return stay(None);
+            }
+            if count > policy.max_repeats && policy.keep_open {
+                return stay(None);
             }
             if count > policy.max_repeats {
                 return Step {
@@ -202,6 +225,12 @@ mod tests {
             repeat_every_min: 0,
             ..Policy::default()
         };
+        let meds = Policy {
+            hold: Hold::Never,
+            pause_when_away: true,
+            keep_open: true,
+            ..Policy::default()
+        };
         let d = |phone, ring, count| Some(Delivery { phone, ring, count });
         #[rustfmt::skip]
         let cases: &[Case] = &[
@@ -223,6 +252,13 @@ mod tests {
             ("repeat held while busy", Phase::Delivered { count: 1, last: 1000 }, &held, State::Focus, 1600, Phase::Delivered { count: 1, last: 1000 }, None, Some(1600 + 7200)),
             ("final repeat rings", Phase::Delivered { count: 2, last: 1000 }, &ringing, State::Browsing, 1600, Phase::Delivered { count: 3, last: 1600 }, d(true, true, 3), None),
             ("no repeats waits for ack", Phase::Delivered { count: 1, last: 1000 }, &once, State::Browsing, 99_999, Phase::Delivered { count: 1, last: 1000 }, None, None),
+            ("dose due while asleep waits", Phase::Pending, &meds, State::Away, 1000, Phase::Deferred { since: 1000 }, None, None),
+            ("dose still waits hours later", Phase::Deferred { since: 1000 }, &meds, State::Away, 30_000, Phase::Deferred { since: 1000 }, None, None),
+            ("dose delivers on waking", Phase::Deferred { since: 1000 }, &meds, State::Active, 30_000, Phase::Delivered { count: 1, last: 30_000 }, d(false, false, 1), Some(30_600)),
+            ("dose fires while gaming", Phase::Pending, &meds, State::Gaming, 1000, Phase::Delivered { count: 1, last: 1000 }, d(false, false, 1), Some(1600)),
+            ("missed dose never expires", Phase::Pending, &meds, State::Browsing, 1000 + GRACE * 10, Phase::Delivered { count: 1, last: 1000 + GRACE * 10 }, d(false, false, 1), Some(1000 + GRACE * 10 + 600)),
+            ("repeat waits while asleep", Phase::Delivered { count: 1, last: 1000 }, &meds, State::Away, 1600, Phase::Delivered { count: 1, last: 1000 }, None, None),
+            ("dose stays open after repeats", Phase::Delivered { count: 4, last: 1000 }, &meds, State::Browsing, 1600, Phase::Delivered { count: 4, last: 1000 }, None, None),
             ("acked is terminal", Phase::Acked, &held, State::Browsing, 5000, Phase::Acked, None, None),
         ];
         for (name, phase, policy, state, now, want_phase, want_deliver, want_wake) in cases {

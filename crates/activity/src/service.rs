@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use activity_core::dose::DAY;
 use activity_core::store::{self, ReminderSpec};
 use async_channel::Sender;
 use parking_lot::Mutex;
@@ -40,7 +41,7 @@ fn parse_spec(json: &str) -> fdo::Result<ReminderSpec> {
 fn parse_id(id: &str) -> fdo::Result<i64> {
     id.trim()
         .parse()
-        .map_err(|_| fdo::Error::InvalidArgs(format!("bad reminder id {id:?}")))
+        .map_err(|_| fdo::Error::InvalidArgs(format!("bad id {id:?}")))
 }
 
 impl Service {
@@ -129,6 +130,69 @@ impl Service {
             .ok_or_else(|| fdo::Error::InvalidArgs("snooze must be 1 to 1440 minutes".into()))?;
         self.resolve(conn, parse_id(id)?, Resolution::Snooze(minutes))
             .await
+    }
+
+    /// Logs a dose of a medicine reminder. `at` is unix seconds, or empty for
+    /// now; up to two days back. Returns the warnings as JSON.
+    async fn take_dose(
+        &self,
+        #[zbus(connection)] conn: &zbus::Connection,
+        id: &str,
+        at: &str,
+    ) -> fdo::Result<String> {
+        let now = daemon::now();
+        let taken_at = if at.trim().is_empty() {
+            now
+        } else {
+            at.trim()
+                .parse::<i64>()
+                .ok()
+                .filter(|t| (now - 2 * DAY..=now + 60).contains(t))
+                .ok_or_else(|| {
+                    fdo::Error::InvalidArgs("dose time must be within the last two days".into())
+                })?
+                .min(now)
+        };
+        let (warnings, shown) = self
+            .shared
+            .lock()
+            .take_dose(parse_id(id)?, taken_at, now)
+            .map_err(|e| to_fdo(&e))?;
+        if let Some(n) = shown
+            && let Ok(proxy) = NotificationsProxy::new(conn).await
+        {
+            let _ = proxy.close_notification(n).await;
+        }
+        self.changed().await;
+        serde_json::to_string(&warnings).map_err(|e| fdo::Error::Failed(e.to_string()))
+    }
+
+    async fn delete_dose(&self, dose_id: &str) -> fdo::Result<()> {
+        self.shared
+            .lock()
+            .delete_dose(parse_id(dose_id)?, daemon::now())
+            .map_err(|e| to_fdo(&e))?;
+        self.changed().await;
+        Ok(())
+    }
+
+    /// Doses from the last `days` days (1 to 90); `id` empty means every medicine.
+    fn doses(&self, id: &str, days: &str) -> fdo::Result<String> {
+        let id = if id.trim().is_empty() {
+            None
+        } else {
+            Some(parse_id(id)?)
+        };
+        let days = days
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|d| (1..=90).contains(d))
+            .ok_or_else(|| fdo::Error::InvalidArgs("days must be 1 to 90".into()))?;
+        self.shared
+            .lock()
+            .doses_json(id, days, daemon::now())
+            .map_err(|e| to_fdo(&e))
     }
 
     fn current_state(&self) -> String {

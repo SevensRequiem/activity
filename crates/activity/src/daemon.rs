@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use activity_core::classify::{Classifier, Snapshot, State, Verdict};
+use activity_core::dose::{self, DAY, Rules, Warning};
 use activity_core::policy::{Delivery, Phase, step};
 use activity_core::store::{self, Occurrence, Store};
 use anyhow::{Context, Result};
@@ -11,7 +12,7 @@ use futures_lite::{FutureExt, StreamExt};
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use parking_lot::Mutex;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::config::{self, Config};
 use crate::notify::{self, NotificationsProxy};
@@ -100,8 +101,7 @@ impl Shared {
                     _ => return Ok(()),
                 };
                 if let Some(mut o) = self.store.find_by_notification(notification)? {
-                    resolve(&mut o, resolution, now);
-                    self.store.save_occurrence(&o)?;
+                    self.close(&mut o, resolution, now)?;
                 }
             }
             Event::Changed | Event::Quit => {}
@@ -122,8 +122,7 @@ impl Shared {
             .open_occurrence_for(reminder_id)?
             .ok_or(store::Error::NotFound(reminder_id))?;
         let shown = o.notification;
-        resolve(&mut o, r, now);
-        self.store.save_occurrence(&o)?;
+        self.close(&mut o, r, now)?;
         Ok(shown)
     }
 
@@ -159,15 +158,23 @@ impl Shared {
             if self.store.open_occurrence_for(r.id)?.is_some() {
                 continue;
             }
-            // A new reminder starts from now; an existing one continues after its
-            // last occurrence, catching up on any missed within the grace window.
-            let after = self
-                .store
-                .last_due(r.id)?
-                .map_or(now, |last| last.max(now - self.grace));
-            let after = Timestamp::from_second(after).context("timestamp out of range")?;
-            if let Some(next) = r.spec.schedule.next_after(after, &self.tz) {
-                self.store.insert_occurrence(r.id, next.as_second())?;
+            let next = if let Some(rules) = r.spec.schedule.doses() {
+                Some(self.next_dose(r.id, rules, now)?)
+            } else {
+                // A new reminder starts from now; an existing one continues after its
+                // last occurrence, catching up on any missed within the grace window.
+                let after = self
+                    .store
+                    .last_due(r.id)?
+                    .map_or(now, |last| last.max(now - self.grace));
+                let after = Timestamp::from_second(after).context("timestamp out of range")?;
+                r.spec
+                    .schedule
+                    .next_after(after, &self.tz)
+                    .map(Timestamp::as_second)
+            };
+            if let Some(next) = next {
+                self.store.insert_occurrence(r.id, next)?;
             }
         }
 
@@ -211,19 +218,152 @@ impl Shared {
     pub fn reminders_json(&self, now: i64) -> Result<String, store::Error> {
         let open = self.store.open_occurrences()?;
         let after = Timestamp::from_second(now).unwrap_or(Timestamp::UNIX_EPOCH);
-        let list: Vec<_> = self
-            .store
-            .reminders()?
-            .into_iter()
-            .map(|r| {
-                let occ = open.iter().find(|o| o.reminder_id == r.id);
+        let mut list = Vec::new();
+        for r in self.store.reminders()? {
+            let occ = open.iter().find(|o| o.reminder_id == r.id);
+            let (next, dose) = if let Some(rules) = r.spec.schedule.doses() {
+                let doses = self.dose_history(r.id, now)?;
+                let next = match occ {
+                    Some(o) => o.due,
+                    None => self.next_dose(r.id, rules, now)?,
+                };
+                let dose = json!({
+                    "last": doses.last(),
+                    "earliest": dose::earliest_safe(rules, &doses),
+                    "in_24h": doses.iter().filter(|t| **t > now - DAY).count(),
+                    "max": rules.max_per_day,
+                });
+                (Some(next), dose)
+            } else {
                 let next = occ.map(|o| o.due).or_else(|| {
                     r.spec
                         .schedule
                         .next_after(after, &self.tz)
                         .map(Timestamp::as_second)
                 });
-                json!({ "reminder": r, "next": next, "phase": occ.map(|o| o.phase) })
+                (next, Value::Null)
+            };
+            list.push(
+                json!({ "reminder": r, "next": next, "phase": occ.map(|o| o.phase), "dose": dose }),
+            );
+        }
+        Ok(serde_json::to_string(&list)?)
+    }
+
+    /// Doses taken sorted ascending: two days of them, which covers the 24h cap
+    /// window behind any due time, or the last one ever when that's older.
+    fn dose_history(&self, id: i64, now: i64) -> Result<Vec<i64>, store::Error> {
+        let mut taken: Vec<i64> = self
+            .store
+            .doses(Some(id), now - 2 * DAY)?
+            .iter()
+            .map(|d| d.taken_at)
+            .collect();
+        if taken.is_empty() {
+            taken.extend(self.store.last_dose(id)?);
+        }
+        Ok(taken)
+    }
+
+    fn next_dose(&self, id: i64, rules: Rules, now: i64) -> Result<i64, store::Error> {
+        let doses = self.dose_history(id, now)?;
+        let missed = self
+            .store
+            .last_missed_due(id, doses.last().copied().unwrap_or(i64::MIN))?;
+        Ok(dose::next_due(rules, &doses, missed, now))
+    }
+
+    fn dose_rules(&self, id: i64) -> Result<Rules, store::Error> {
+        self.store
+            .reminders()?
+            .into_iter()
+            .find(|r| r.id == id)
+            .ok_or(store::Error::NotFound(id))?
+            .spec
+            .schedule
+            .doses()
+            .ok_or(store::Error::NotDoses(id))
+    }
+
+    /// Resolves an occurrence. Acknowledging a medicine reminder logs the dose now.
+    fn close(&mut self, o: &mut Occurrence, r: Resolution, now: i64) -> Result<(), store::Error> {
+        resolve(o, r, now);
+        self.store.save_occurrence(o)?;
+        let is_dose = match self.dose_rules(o.reminder_id) {
+            Ok(_) => true,
+            Err(store::Error::NotDoses(_) | store::Error::NotFound(_)) => false,
+            Err(e) => return Err(e),
+        };
+        if matches!(r, Resolution::Ack) && is_dose {
+            self.store.log_dose(o.reminder_id, now, now)?;
+        }
+        Ok(())
+    }
+
+    /// Logs a dose taken at `taken_at` (now or backdated). A dose newer than every
+    /// logged one satisfies the open occurrence; an older one only re-times it.
+    /// Returns the warnings and the notification to close, if one is showing.
+    pub fn take_dose(
+        &mut self,
+        id: i64,
+        taken_at: i64,
+        now: i64,
+    ) -> Result<(Vec<Warning>, Option<u32>), store::Error> {
+        let rules = self.dose_rules(id)?;
+        let others: Vec<i64> = self
+            .store
+            .doses(Some(id), taken_at - DAY)?
+            .iter()
+            .map(|d| d.taken_at)
+            .collect();
+        let warnings = dose::warnings(rules, &others, taken_at);
+        let newest = self.store.last_dose(id)?.is_none_or(|l| taken_at >= l);
+        self.store.log_dose(id, taken_at, now)?;
+        let mut shown = None;
+        if newest && let Some(mut o) = self.store.open_occurrence_for(id)? {
+            shown = o.notification;
+            o.phase = Phase::Acked;
+            self.store.save_occurrence(&o)?;
+        } else {
+            self.retime_dose(id, rules, now)?;
+        }
+        Ok((warnings, shown))
+    }
+
+    pub fn delete_dose(&mut self, dose_id: i64, now: i64) -> Result<(), store::Error> {
+        let id = self.store.delete_dose(dose_id)?;
+        if let Ok(rules) = self.dose_rules(id) {
+            self.retime_dose(id, rules, now)?;
+        }
+        Ok(())
+    }
+
+    /// Recomputes a pending dose's due time after the history changed under it.
+    fn retime_dose(&mut self, id: i64, rules: Rules, now: i64) -> Result<(), store::Error> {
+        if let Some(mut o) = self.store.open_occurrence_for(id)?
+            && o.phase == Phase::Pending
+        {
+            o.due = self.next_dose(id, rules, now)?;
+            self.store.save_occurrence(&o)?;
+        }
+        Ok(())
+    }
+
+    /// Doses from the last `days` days, newest first, with the reminder title.
+    pub fn doses_json(&self, id: Option<i64>, days: u32, now: i64) -> Result<String, store::Error> {
+        let titles = self.store.reminders()?;
+        let list: Vec<_> = self
+            .store
+            .doses(id, now - i64::from(days) * DAY)?
+            .into_iter()
+            .rev()
+            .map(|d| {
+                let title = titles
+                    .iter()
+                    .find(|r| r.id == d.reminder_id)
+                    .map_or("", |r| r.spec.title.as_str());
+                json!({ "id": d.id, "reminder_id": d.reminder_id, "title": title,
+                        "taken_at": d.taken_at, "logged_at": d.logged_at })
             })
             .collect();
         Ok(serde_json::to_string(&list)?)

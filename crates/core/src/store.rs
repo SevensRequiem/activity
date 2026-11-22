@@ -44,6 +44,15 @@ pub struct Occurrence {
     pub notification: Option<u32>,
 }
 
+/// One dose as actually taken. `logged_at` differs from `taken_at` when backdated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Dose {
+    pub id: i64,
+    pub reminder_id: i64,
+    pub taken_at: i64,
+    pub logged_at: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Span {
     pub start: i64,
@@ -65,6 +74,10 @@ pub enum Error {
     Policy(#[from] crate::policy::Error),
     #[error("no reminder with id {0}")]
     NotFound(i64),
+    #[error("no dose with id {0}")]
+    NoDose(i64),
+    #[error("reminder {0} is not a medicine reminder")]
+    NotDoses(i64),
     #[error(transparent)]
     Sql(#[from] rusqlite::Error),
     #[error("stored row is corrupt: {0}")]
@@ -120,6 +133,13 @@ CREATE TABLE IF NOT EXISTS activity_log (
     caption TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS activity_log_start ON activity_log(start);
+CREATE TABLE IF NOT EXISTS doses (
+    id INTEGER PRIMARY KEY,
+    reminder_id INTEGER NOT NULL REFERENCES reminders(id) ON DELETE CASCADE,
+    taken_at INTEGER NOT NULL,
+    logged_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS doses_taken ON doses(reminder_id, taken_at);
 ";
 
 impl Store {
@@ -265,6 +285,64 @@ impl Store {
     pub fn last_due(&self, reminder_id: i64) -> Result<Option<i64>, Error> {
         Ok(self.db.query_row(
             "SELECT MAX(due) FROM occurrences WHERE reminder_id = ?1",
+            [reminder_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Due time of the latest dose occurrence after `since` that closed without
+    /// being taken (skipped or expired), which restarts dose spacing. Acked ones
+    /// don't count: the dose log has the real time.
+    pub fn last_missed_due(&self, reminder_id: i64, since: i64) -> Result<Option<i64>, Error> {
+        Ok(self.db.query_row(
+            "SELECT MAX(due) FROM occurrences WHERE reminder_id = ?1 AND open = 0 AND phase != ?2 AND due > ?3",
+            params![reminder_id, serde_json::to_string(&Phase::Acked)?, since],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn log_dose(&self, reminder_id: i64, taken_at: i64, logged_at: i64) -> Result<i64, Error> {
+        self.db.execute(
+            "INSERT INTO doses (reminder_id, taken_at, logged_at) VALUES (?1, ?2, ?3)",
+            [reminder_id, taken_at, logged_at],
+        )?;
+        Ok(self.db.last_insert_rowid())
+    }
+
+    /// Returns the reminder the dose belonged to.
+    pub fn delete_dose(&self, id: i64) -> Result<i64, Error> {
+        self.db
+            .query_row(
+                "DELETE FROM doses WHERE id = ?1 RETURNING reminder_id",
+                [id],
+                |r| r.get(0),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Error::NoDose(id),
+                e => e.into(),
+            })
+    }
+
+    /// Doses taken at or after `since`, oldest first; all reminders when `reminder_id` is `None`.
+    pub fn doses(&self, reminder_id: Option<i64>, since: i64) -> Result<Vec<Dose>, Error> {
+        let mut stmt = self.db.prepare(
+            "SELECT id, reminder_id, taken_at, logged_at FROM doses
+             WHERE taken_at >= ?2 AND (?1 IS NULL OR reminder_id = ?1) ORDER BY taken_at",
+        )?;
+        let rows = stmt.query_map(params![reminder_id, since], |r| {
+            Ok(Dose {
+                id: r.get(0)?,
+                reminder_id: r.get(1)?,
+                taken_at: r.get(2)?,
+                logged_at: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn last_dose(&self, reminder_id: i64) -> Result<Option<i64>, Error> {
+        Ok(self.db.query_row(
+            "SELECT MAX(taken_at) FROM doses WHERE reminder_id = ?1",
             [reminder_id],
             |r| r.get(0),
         )?)
@@ -430,6 +508,39 @@ mod tests {
     fn unknown_fields_rejected() {
         let bad = r#"{"title":"x","schedule":{"kind":"daily","times":["09:00"]},"evil":1}"#;
         assert!(serde_json::from_str::<ReminderSpec>(bad).is_err());
+    }
+
+    #[test]
+    fn dose_log() -> Result<(), Error> {
+        let s = store();
+        let a = s.add_reminder(&spec("meds"))?;
+        let b = s.add_reminder(&spec("other"))?;
+        let d1 = s.log_dose(a, 100, 100)?;
+        s.log_dose(a, 50, 300)?;
+        s.log_dose(b, 200, 200)?;
+        let taken: Vec<i64> = s.doses(Some(a), 0)?.iter().map(|d| d.taken_at).collect();
+        assert_eq!(taken, [50, 100]);
+        assert_eq!(s.doses(None, 0)?.len(), 3);
+        assert_eq!(s.doses(None, 101)?.len(), 1);
+        assert_eq!(s.last_dose(a)?, Some(100));
+
+        let skipped = s.insert_occurrence(a, 400)?;
+        s.save_occurrence(&Occurrence {
+            id: skipped,
+            reminder_id: a,
+            due: 400,
+            phase: Phase::Skipped,
+            notification: None,
+        })?;
+        assert_eq!(s.last_missed_due(a, 100)?, Some(400));
+        assert_eq!(s.last_missed_due(a, 400)?, None);
+
+        s.delete_dose(d1)?;
+        assert_eq!(s.last_dose(a)?, Some(50));
+        assert!(matches!(s.delete_dose(d1), Err(Error::NoDose(_))));
+        s.delete_reminder(a)?;
+        assert_eq!(s.doses(None, 0)?.len(), 1);
+        Ok(())
     }
 
     #[test]
