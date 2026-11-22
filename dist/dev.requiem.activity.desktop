@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Activity
+Comment=Activity-aware reminders
+Exec=plasmawindowed dev.requiem.activity
+Icon=appointment-soon
+Categories=Utility;
