@@ -1,3 +1,5 @@
+![activity: reminders that know what you're doing](assets/banner.svg)
+
 # activity
 
 Reminders for KDE Plasma 6 on Wayland that know what you're doing. A daemon watches the focused window, idle time, the screen lock and what's playing. It holds a reminder while you're gaming or watching something, repeats it while you ignore it, and pings your phone over KDE Connect when you're away. It also tracks time spent on music, video and voice calls, with daily and weekly stats.
