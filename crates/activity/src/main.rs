@@ -273,6 +273,42 @@ fn print_list(text: &str) -> Result<()> {
     Ok(())
 }
 
+fn print_timeline(text: &str) -> Result<()> {
+    let v: Value = serde_json::from_str(text)?;
+    let row = |s: &Value, what: &str, detail: &str| {
+        let start = s["start"].as_i64().unwrap_or(0);
+        let end = s["end"].as_i64().unwrap_or_else(daemon::now);
+        println!(
+            "{}  {:>4} min  {what:<9} {detail}",
+            local(start),
+            (end - start) / 60
+        );
+    };
+    for s in v["activity"].as_array().into_iter().flatten() {
+        row(
+            s,
+            s["state"].as_str().unwrap_or("?"),
+            s["class"].as_str().unwrap_or(""),
+        );
+    }
+    let media = v["media"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    if !media.is_empty() {
+        println!("\nmedia and calls");
+    }
+    for s in media {
+        row(
+            s,
+            s["kind"].as_str().unwrap_or("?"),
+            s["source"].as_str().unwrap_or(""),
+        );
+    }
+    Ok(())
+}
+
 fn print_warnings(text: &str) -> Result<()> {
     for w in serde_json::from_str::<Vec<Value>>(text)? {
         match w["kind"].as_str() {
@@ -369,21 +405,19 @@ async fn client(cmd: Cmd) -> Result<()> {
                 s["input_idle_secs"],
                 s["locked"],
             );
+            for p in v["playing"].as_array().into_iter().flatten() {
+                let since = p["since"].as_i64().unwrap_or(0);
+                println!(
+                    "playing: {} ({}) since {}",
+                    p["source"].as_str().unwrap_or("?"),
+                    p["kind"].as_str().unwrap_or("?"),
+                    local(since)
+                );
+            }
         }
         Cmd::Timeline { date } => {
             let text = text(&conn, "Timeline", &(date.unwrap_or_default(),)).await?;
-            let spans: Vec<Value> = serde_json::from_str(&text)?;
-            for s in spans {
-                let start = s["start"].as_i64().unwrap_or(0);
-                let end = s["end"].as_i64().unwrap_or_else(daemon::now);
-                println!(
-                    "{}  {:>4} min  {:<9} {}",
-                    local(start),
-                    (end - start) / 60,
-                    s["state"].as_str().unwrap_or("?"),
-                    s["class"].as_str().unwrap_or("")
-                );
-            }
+            print_timeline(&text)?;
         }
         Cmd::Took { id, ago, at } => {
             let taken = match (ago, at) {

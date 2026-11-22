@@ -4,6 +4,7 @@ use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
 use crate::classify::State;
+use crate::media::Kind;
 use crate::policy::{Phase, Policy};
 use crate::schedule::Schedule;
 
@@ -60,6 +61,16 @@ pub struct Span {
     pub state: State,
     pub class: String,
     pub caption: String,
+}
+
+/// Time spent on one source. Only the site or app name is kept, never a
+/// title or URL. `end` is the last checkpoint while the span is still open.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MediaSpan {
+    pub start: i64,
+    pub end: i64,
+    pub kind: Kind,
+    pub source: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -140,6 +151,15 @@ CREATE TABLE IF NOT EXISTS doses (
     logged_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS doses_taken ON doses(reminder_id, taken_at);
+CREATE TABLE IF NOT EXISTS media_log (
+    id INTEGER PRIMARY KEY,
+    start INTEGER NOT NULL,
+    end INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    source TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS media_log_start ON media_log(start);
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 ";
 
 impl Store {
@@ -397,6 +417,16 @@ impl Store {
         Ok(())
     }
 
+    /// Ends the open activity row at `end`: on quit, after a suspend, and at
+    /// startup for a row the last run left open.
+    pub fn close_activity(&self, end: i64) -> Result<(), Error> {
+        self.db.execute(
+            "UPDATE activity_log SET end = MAX(start, ?1) WHERE end IS NULL",
+            [end],
+        )?;
+        Ok(())
+    }
+
     pub fn timeline(&self, from: i64, to: i64) -> Result<Vec<Span>, Error> {
         let mut stmt = self.db.prepare(
             "SELECT start, end, state, class, caption FROM activity_log
@@ -422,6 +452,70 @@ impl Store {
             })
         })
         .collect()
+    }
+
+    pub fn insert_media(
+        &self,
+        start: i64,
+        end: i64,
+        kind: Kind,
+        source: &str,
+    ) -> Result<i64, Error> {
+        self.db.execute(
+            "INSERT INTO media_log (start, end, kind, source) VALUES (?1, ?2, ?3, ?4)",
+            params![start, end, serde_json::to_string(&kind)?, source],
+        )?;
+        Ok(self.db.last_insert_rowid())
+    }
+
+    pub fn extend_media(&self, id: i64, end: i64) -> Result<(), Error> {
+        self.db
+            .execute("UPDATE media_log SET end = ?2 WHERE id = ?1", [id, end])?;
+        Ok(())
+    }
+
+    /// Spans overlapping `[from, to)`, unclipped.
+    pub fn media(&self, from: i64, to: i64) -> Result<Vec<MediaSpan>, Error> {
+        let mut stmt = self.db.prepare(
+            "SELECT start, end, kind, source FROM media_log
+             WHERE start < ?2 AND end > ?1 ORDER BY start",
+        )?;
+        let rows = stmt.query_map([from, to], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (start, end, kind, source) = row?;
+            Ok(MediaSpan {
+                start,
+                end,
+                kind: serde_json::from_str(&kind)?,
+                source,
+            })
+        })
+        .collect()
+    }
+
+    pub fn meta_get(&self, key: &str) -> Result<Option<String>, Error> {
+        let mut stmt = self.db.prepare("SELECT value FROM meta WHERE key = ?1")?;
+        let mut rows = stmt.query([key])?;
+        Ok(match rows.next()? {
+            Some(r) => Some(r.get(0)?),
+            None => None,
+        })
+    }
+
+    pub fn meta_set(&self, key: &str, value: &str) -> Result<(), Error> {
+        self.db.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            [key, value],
+        )?;
+        Ok(())
     }
 }
 
@@ -553,6 +647,45 @@ mod tests {
         assert_eq!(spans[0].end, Some(200));
         assert_eq!(spans[1].end, None);
         assert_eq!(s.timeline(0, 100)?.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn media_and_meta_round_trip() -> Result<(), Error> {
+        let s = store();
+        let a = s.insert_media(100, 130, Kind::Video, "YouTube")?;
+        s.insert_media(300, 400, Kind::Call, "Discord")?;
+        s.extend_media(a, 190)?;
+        let spans = s.media(150, 1000)?;
+        assert_eq!(spans.len(), 2);
+        assert_eq!(
+            spans[0],
+            MediaSpan {
+                start: 100,
+                end: 190,
+                kind: Kind::Video,
+                source: "YouTube".into()
+            }
+        );
+        assert_eq!(s.media(190, 300)?.len(), 0, "touching edges don't overlap");
+
+        assert_eq!(s.meta_get("summary_sent")?, None);
+        s.meta_set("summary_sent", "1")?;
+        s.meta_set("summary_sent", "2")?;
+        assert_eq!(s.meta_get("summary_sent")?.as_deref(), Some("2"));
+        Ok(())
+    }
+
+    #[test]
+    fn close_activity_ends_the_open_row() -> Result<(), Error> {
+        let s = store();
+        s.log_state(100, State::Focus, "kate", "")?;
+        s.close_activity(500)?;
+        s.close_activity(900)?;
+        s.log_state(1000, State::Gaming, "game", "")?;
+        s.close_activity(50)?;
+        let ends: Vec<_> = s.timeline(0, 2000)?.iter().map(|x| x.end).collect();
+        assert_eq!(ends, [Some(500), Some(1000)]);
         Ok(())
     }
 }

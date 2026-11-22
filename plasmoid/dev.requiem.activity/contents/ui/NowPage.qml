@@ -49,11 +49,23 @@ ColumnLayout {
             PC3.Label {
                 Layout.fillWidth: true
                 elide: Text.ElideRight
+                textFormat: Text.PlainText
                 text: (snap.class || "no window") + (snap.caption ? " — " + snap.caption : "")
+            }
+            Repeater {
+                model: app.current.playing || []
+                PC3.Label {
+                    required property var modelData
+                    Layout.fillWidth: true
+                    elide: Text.ElideRight
+                    textFormat: Text.PlainText
+                    text: (modelData.kind === "call" ? "In a " + modelData.source + " call" : "Playing " + modelData.source + " (" + modelData.kind + ")")
+                          + " · " + app.dur(Math.max(0, Math.round((Date.now() / 1000 - modelData.since) / 60)))
+                }
             }
             PC3.Label {
                 opacity: 0.7
-                text: [snap.media_playing ? "media playing" : "", snap.fullscreen ? "fullscreen" : "",
+                text: [snap.fullscreen ? "fullscreen" : "",
                        snap.input_idle_secs ? "idle " + Math.round(snap.input_idle_secs / 60) + " min" : "",
                        snap.locked ? "locked" : ""].filter(s => s).join(" · ")
             }

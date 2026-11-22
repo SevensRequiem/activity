@@ -81,6 +81,24 @@ pub async fn desktop(
         .context("sending desktop notification")
 }
 
+/// Information only: no actions, and it expires like any other notification.
+pub async fn summary(proxy: &NotificationsProxy<'_>, title: &str, body: &str) -> Result<u32> {
+    let hints = HashMap::from([("desktop-entry", Value::from("dev.requiem.activity"))]);
+    proxy
+        .notify(
+            "Activity",
+            0,
+            "view-statistics",
+            title,
+            body,
+            &[],
+            hints,
+            -1,
+        )
+        .await
+        .context("sending summary notification")
+}
+
 pub async fn watch_actions(conn: zbus::Connection, tx: Sender<Event>) -> Result<()> {
     let proxy = NotificationsProxy::new(&conn).await?;
     let mut actions = proxy.receive_action_invoked().await?;

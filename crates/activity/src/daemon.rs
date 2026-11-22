@@ -3,8 +3,10 @@ use std::time::Duration;
 
 use activity_core::classify::{Classifier, Snapshot, State, Verdict};
 use activity_core::dose::{self, DAY, Rules, Warning};
+use activity_core::media::{CHECKPOINT_SECS, GAP_SECS, Key, Kind, Sources, Tracker, Voice, Write};
 use activity_core::policy::{Delivery, Phase, step};
-use activity_core::store::{self, Occurrence, Store};
+use activity_core::stats::{self, Summary, SummaryConfig, Window};
+use activity_core::store::{self, MediaSpan, Occurrence, Store};
 use anyhow::{Context, Result};
 use async_channel::{Receiver, Sender};
 use async_executor::LocalExecutor;
@@ -20,6 +22,8 @@ use crate::sensors::{self, IDLE_PROBE_SECS};
 use crate::service::{self, Service};
 
 pub const MAX_CAPTION: usize = 300;
+const SUMMARY_SENT: &str = "summary_sent";
+const ALIVE: &str = "alive";
 
 #[derive(Debug)]
 pub enum Event {
@@ -30,7 +34,10 @@ pub enum Event {
     },
     Idle(bool),
     Locked(bool),
-    Media(bool),
+    /// What's playing, already reduced to site or app and kind.
+    Media(Vec<Key>),
+    /// The voice app that's in a call, if any.
+    Voice(Option<String>),
     Action {
         notification: u32,
         key: String,
@@ -67,6 +74,12 @@ pub struct Shared {
     idle_since: Option<i64>,
     tz: TimeZone,
     grace: i64,
+    tracker: Tracker,
+    playing: Vec<Key>,
+    call: Option<String>,
+    summary: SummaryConfig,
+    alive: i64,
+    alive_saved: i64,
 }
 
 pub fn now() -> i64 {
@@ -92,7 +105,11 @@ impl Shared {
             Event::Idle(true) => self.idle_since = Some(now - i64::from(IDLE_PROBE_SECS)),
             Event::Idle(false) => self.idle_since = None,
             Event::Locked(locked) => self.snapshot.locked = locked,
-            Event::Media(playing) => self.snapshot.media_playing = playing,
+            Event::Media(playing) => {
+                self.snapshot.media_playing = !playing.is_empty();
+                self.playing = playing;
+            }
+            Event::Voice(call) => self.call = call,
             Event::Action { notification, key } => {
                 let resolution = match key.as_str() {
                     notify::ACTION_DONE => Resolution::Ack,
@@ -149,6 +166,7 @@ impl Shared {
     /// Creates missing occurrences and steps every open one. Returns what to
     /// send and when the loop next needs to run.
     fn plan(&mut self, now: i64) -> Result<(Vec<Outgoing>, i64)> {
+        self.track(now)?;
         self.classify(now)?;
         let state = self.verdict.state;
         let reminders = self.store.reminders()?;
@@ -369,25 +387,152 @@ impl Shared {
         Ok(serde_json::to_string(&list)?)
     }
 
+    /// `playing` includes calls and spans still too short to be stored.
     pub fn state_json(&self) -> String {
-        json!({ "verdict": self.verdict, "snapshot": self.snapshot }).to_string()
+        let playing: Vec<Value> = self
+            .tracker
+            .open()
+            .map(|((source, kind), since, _)| json!({ "source": source, "kind": kind, "since": since }))
+            .collect();
+        json!({ "verdict": self.verdict, "snapshot": self.snapshot, "playing": playing })
+            .to_string()
     }
 
-    /// Spans for one local day, `date` as YYYY-MM-DD or empty for today.
-    pub fn timeline_json(&self, date: &str) -> Result<String, String> {
+    /// Activity spans and media sessions for one local day, `date` as
+    /// YYYY-MM-DD or empty for today.
+    pub fn timeline_json(&self, date: &str, now: i64) -> Result<String, String> {
         let day = if date.is_empty() {
-            Timestamp::now().to_zoned(self.tz.clone()).date()
+            self.date_of(now).map_err(|e| e.to_string())?
         } else {
             date.parse::<jiff::civil::Date>()
                 .map_err(|e| e.to_string())?
         };
-        let start = day.to_zoned(self.tz.clone()).map_err(|e| e.to_string())?;
-        let end = start.tomorrow().map_err(|e| e.to_string())?;
-        let spans = self
+        let w = Window::ending(day, 1, &self.tz).map_err(|e| e.to_string())?;
+        let activity = self
             .store
-            .timeline(start.timestamp().as_second(), end.timestamp().as_second())
+            .timeline(w.from, w.to)
             .map_err(|e| e.to_string())?;
-        serde_json::to_string(&spans).map_err(|e| e.to_string())
+        let media = self
+            .media_spans(w.from, w.to, now)
+            .map_err(|e| e.to_string())?;
+        let media = stats::sessions(&media);
+        Ok(json!({ "activity": activity, "media": media }).to_string())
+    }
+
+    /// Usage over the `days` local days ending today, and the days before.
+    pub fn stats_json(&self, days: u32, now: i64) -> Result<String> {
+        let s = self.summarize(self.date_of(now)?, days, now)?;
+        Ok(serde_json::to_string(&s)?)
+    }
+
+    fn date_of(&self, ts: i64) -> Result<jiff::civil::Date, jiff::Error> {
+        Ok(self.tz.to_datetime(Timestamp::from_second(ts)?).date())
+    }
+
+    fn summarize(&self, last: jiff::civil::Date, days: u32, now: i64) -> Result<Summary> {
+        let w = Window::ending(last, days, &self.tz)?;
+        let media = self.media_spans(w.prev_from, w.to, now)?;
+        let activity = self.store.timeline(w.prev_from, w.to)?;
+        Ok(stats::summary(&media, &activity, &w, now, &self.tz))
+    }
+
+    /// Stored media spans, with the ones still playing extended to now
+    /// instead of their last checkpoint.
+    fn media_spans(&self, from: i64, to: i64, now: i64) -> Result<Vec<MediaSpan>, store::Error> {
+        // A playing span's stored end can lag up to a checkpoint behind `from`.
+        let mut spans = self.store.media(from - CHECKPOINT_SECS, to)?;
+        for ((source, kind), start, row) in self.tracker.open() {
+            if row.is_none() {
+                continue;
+            }
+            if let Some(s) = spans
+                .iter_mut()
+                .find(|s| s.start == start && s.kind == *kind && s.source == *source)
+            {
+                s.end = s.end.max(now);
+            }
+        }
+        spans.retain(|s| s.end > from);
+        Ok(spans)
+    }
+
+    /// Activity rows stay open until the next state change, so a gap between
+    /// loop passes (suspend without a lock) would count the sleep as whatever
+    /// was on screen. Runs before any event of the pass is applied.
+    fn heartbeat(&mut self, now: i64) -> Result<(), store::Error> {
+        if now - self.alive > GAP_SECS {
+            self.store.close_activity(self.alive)?;
+            self.store.log_state(
+                now,
+                self.verdict.state,
+                &self.snapshot.class,
+                &self.snapshot.caption,
+            )?;
+        }
+        self.alive = now;
+        if now - self.alive_saved >= CHECKPOINT_SECS {
+            self.store.meta_set(ALIVE, &now.to_string())?;
+            self.alive_saved = now;
+        }
+        Ok(())
+    }
+
+    fn shut_down(&mut self, now: i64) -> Result<(), store::Error> {
+        let writes = self.tracker.close_all(now);
+        self.write_media(writes)?;
+        self.store.close_activity(now)?;
+        self.store.meta_set(ALIVE, &now.to_string())
+    }
+
+    /// Feeds what's playing now, calls included, to the tracker.
+    fn track(&mut self, now: i64) -> Result<(), store::Error> {
+        let mut active = self.playing.clone();
+        active.extend(self.call.clone().map(|c| (c, Kind::Call)));
+        active.sort();
+        active.dedup();
+        let writes = self.tracker.tick(now, &active);
+        self.write_media(writes)
+    }
+
+    fn write_media(&mut self, writes: Vec<Write>) -> Result<(), store::Error> {
+        for w in writes {
+            match w {
+                Write::Insert { key, start, end } => {
+                    let row = self.store.insert_media(start, end, key.1, &key.0)?;
+                    self.tracker.set_row(&key, row);
+                }
+                Write::Extend { row, end } => self.store.extend_media(row, end)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// The weekly summary's slot and text once a slot has passed unsent. The
+    /// first run only records the latest slot, so it doesn't open with an
+    /// empty week.
+    fn weekly(&self, now: i64) -> Result<Option<(i64, String)>> {
+        if !self.summary.enabled {
+            return Ok(None);
+        }
+        let Some(slot) = self.summary.last_slot(now, &self.tz) else {
+            return Ok(None);
+        };
+        let sent = self
+            .store
+            .meta_get(SUMMARY_SENT)?
+            .and_then(|v| v.parse::<i64>().ok());
+        match sent {
+            Some(sent) if sent >= slot => Ok(None),
+            Some(_) => {
+                // The seven whole days before the slot's day, so both weeks are complete.
+                let s = self.summarize(self.date_of(slot)?.yesterday()?, 7, now)?;
+                Ok(Some((slot, stats::digest(&s))))
+            }
+            None => {
+                self.store.meta_set(SUMMARY_SENT, &slot.to_string())?;
+                Ok(None)
+            }
+        }
     }
 }
 
@@ -416,7 +561,24 @@ pub fn run(cfg: Config) -> Result<()> {
         idle_since: None,
         tz: TimeZone::system(),
         grace: i64::from(cfg.grace_secs),
+        tracker: Tracker::new(cfg.media.min_secs),
+        playing: Vec::new(),
+        call: None,
+        summary: cfg.summary.clone(),
+        alive: now(),
+        alive_saved: 0,
     }));
+    {
+        // Ends a row the last run left open where that run was last alive,
+        // not at this run's first state change.
+        let s = shared.lock();
+        let alive = s
+            .store
+            .meta_get(ALIVE)?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(now);
+        s.store.close_activity(alive)?;
+    }
     let (tx, rx) = async_channel::bounded(256);
     let ex = LocalExecutor::new();
     async_io::block_on(ex.run(main_loop(&ex, cfg, shared, tx, rx)))
@@ -429,6 +591,8 @@ async fn main_loop(
     tx: Sender<Event>,
     rx: Receiver<Event>,
 ) -> Result<()> {
+    let sources = Sources::new(&cfg.media)?;
+    let voice = Voice::new(&cfg.media);
     let conn = zbus::connection::Builder::session()?
         .name(service::NAME)?
         .serve_at(
@@ -457,7 +621,7 @@ async fn main_loop(
     );
     spawn(
         "media",
-        sensors::watch_media(conn.clone(), tx.clone()).boxed(),
+        sensors::watch_media(conn.clone(), tx.clone(), sources).boxed(),
     );
     spawn(
         "notification actions",
@@ -477,14 +641,7 @@ async fn main_loop(
         }
         .boxed(),
     );
-    let idle_tx = tx.clone();
-    std::thread::Builder::new()
-        .name("idle".into())
-        .spawn(move || {
-            if let Err(e) = sensors::run_idle(idle_tx) {
-                tracing::warn!("idle sensor stopped: {e:#}");
-            }
-        })?;
+    spawn_threads(&tx, voice)?;
     if let Err(e) = sensors::load_kwin_script(&conn).await {
         tracing::warn!("window tracking unavailable: {e:#}");
     }
@@ -503,6 +660,7 @@ async fn main_loop(
         let mut quit = false;
         {
             let mut s = shared.lock();
+            s.heartbeat(now())?;
             for event in first
                 .into_iter()
                 .chain(std::iter::from_fn(|| rx.try_recv().ok()))
@@ -519,10 +677,57 @@ async fn main_loop(
         for o in outgoing {
             deliver(&conn, &notifier, &cfg, &shared, o).await;
         }
+        send_weekly(&notifier, &shared).await;
+    }
+    if let Err(e) = shared.lock().shut_down(now()) {
+        tracing::warn!("closing open spans: {e}");
     }
     sensors::unload_kwin_script(&conn).await;
     tracing::info!("stopped");
     Ok(())
+}
+
+/// The idle and call sensors block, so each gets its own thread.
+fn spawn_threads(tx: &Sender<Event>, voice: Voice) -> Result<()> {
+    let idle_tx = tx.clone();
+    std::thread::Builder::new()
+        .name("idle".into())
+        .spawn(move || {
+            if let Err(e) = sensors::run_idle(idle_tx) {
+                tracing::warn!("idle sensor stopped: {e:#}");
+            }
+        })?;
+    let voice_tx = tx.clone();
+    std::thread::Builder::new()
+        .name("voice".into())
+        .spawn(move || sensors::run_voice(&voice_tx, &voice))?;
+    Ok(())
+}
+
+/// Sends the weekly summary when one is due. The slot is recorded only once
+/// the notification went out, so a failure retries on the next pass.
+async fn send_weekly(notifier: &NotificationsProxy<'_>, shared: &Mutex<Shared>) {
+    let weekly = shared.lock().weekly(now());
+    let (slot, body) = match weekly {
+        Ok(Some(w)) => w,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!("weekly summary: {e:#}");
+            return;
+        }
+    };
+    if let Err(e) = notify::summary(notifier, "Your week", &body).await {
+        tracing::warn!("{e:#}");
+        return;
+    }
+    tracing::info!("weekly summary sent");
+    if let Err(e) = shared
+        .lock()
+        .store
+        .meta_set(SUMMARY_SENT, &slot.to_string())
+    {
+        tracing::warn!("recording weekly summary: {e}");
+    }
 }
 
 async fn deliver(

@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum State {
     Away,
@@ -281,7 +281,7 @@ impl Classifier {
     }
 }
 
-fn glob_to_regex(glob: &str) -> String {
+pub(crate) fn glob_to_regex(glob: &str) -> String {
     let parts: Vec<String> = glob.split('*').map(regex::escape).collect();
     format!("(?i)^{}$", parts.join(".*"))
 }

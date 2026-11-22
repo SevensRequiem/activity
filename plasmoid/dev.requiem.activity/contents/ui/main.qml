@@ -14,10 +14,14 @@ PlasmoidItem {
     property var current: ({})
     property var reminders: []
     property var spans: []
+    property var mediaSpans: []
+    property var stats: null
+    property int statsDays: 7
     property var doses: []
     property var doseWarnings: []
     property bool online: false
     property bool editing: false
+    property real now: Date.now() / 1000
     property string error: ""
 
     readonly property string stateName: current.verdict ? current.verdict.state : "offline"
@@ -33,6 +37,9 @@ PlasmoidItem {
     readonly property var stateColors: ({
         gaming: "#ff6b9d", watching: "#b48cff", focus: "#57cbde", chatting: "#7bd88f",
         browsing: "#f2c46d", drifting: "#ff9f43", idle: "#6c7086", away: "#3b3f51", active: "#a6adc8"
+    })
+    readonly property var kindColors: ({
+        music: "#7bd88f", video: "#b48cff", podcast: "#f2c46d", call: "#57cbde", other: "#a6adc8"
     })
 
     function call(member, args, done) {
@@ -56,11 +63,24 @@ PlasmoidItem {
     }
 
     function refresh() {
+        root.now = Date.now() / 1000
         call("CurrentState", [], v => root.current = JSON.parse(v))
         call("ListReminders", [], v => root.reminders = JSON.parse(v))
         if (!root.expanded) return
-        call("Timeline", [""], v => root.spans = JSON.parse(v))
+        call("Timeline", [""], v => {
+            const t = JSON.parse(v)
+            root.spans = t.activity
+            root.mediaSpans = t.media
+        })
         call("Doses", ["", "7"], v => root.doses = JSON.parse(v))
+    }
+
+    function fetchStats() {
+        call("Stats", [String(root.statsDays)], v => root.stats = JSON.parse(v))
+    }
+
+    function hm(secs) {
+        return dur(Math.round(secs / 60))
     }
 
     function clock(secs) {
@@ -109,7 +129,10 @@ PlasmoidItem {
         onTriggered: root.refresh()
     }
 
-    onExpandedChanged: if (expanded) refresh()
+    onExpandedChanged: if (expanded) {
+        refresh()
+        fetchStats()
+    }
 
     compactRepresentation: MouseArea {
         onClicked: root.expanded = !root.expanded
@@ -151,13 +174,14 @@ PlasmoidItem {
                 PC3.TabButton { text: "Reminders" }
                 PC3.TabButton { text: "Today" }
                 PC3.TabButton { text: "Meds" }
+                PC3.TabButton { text: "Stats" }
             }
         }
 
         StackLayout {
             anchors.fill: parent
             anchors.margins: Kirigami.Units.smallSpacing
-            currentIndex: root.editing ? 4 : tabs.currentIndex
+            currentIndex: root.editing ? 5 : tabs.currentIndex
 
             NowPage { app: root }
             RemindersPage {
@@ -166,6 +190,7 @@ PlasmoidItem {
             }
             TodayPage { app: root }
             MedsPage { app: root }
+            StatsPage { app: root }
             Editor {
                 id: editor
                 app: root

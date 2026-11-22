@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
 use activity_core::classify::ClassifierConfig;
+use activity_core::media::MediaConfig;
+use activity_core::stats::SummaryConfig;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
@@ -12,6 +14,8 @@ pub struct Config {
     /// A reminder missed by up to this much (suspend, daemon down) still fires.
     pub grace_secs: u32,
     pub classifier: ClassifierConfig,
+    pub media: MediaConfig,
+    pub summary: SummaryConfig,
 }
 
 impl Default for Config {
@@ -20,6 +24,8 @@ impl Default for Config {
             kdeconnect_device: None,
             grace_secs: 1800,
             classifier: ClassifierConfig::default(),
+            media: MediaConfig::default(),
+            summary: SummaryConfig::default(),
         }
     }
 }

@@ -44,6 +44,14 @@ fn parse_id(id: &str) -> fdo::Result<i64> {
         .map_err(|_| fdo::Error::InvalidArgs(format!("bad id {id:?}")))
 }
 
+fn parse_days(days: &str) -> fdo::Result<u32> {
+    days.trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|d| (1..=90).contains(d))
+        .ok_or_else(|| fdo::Error::InvalidArgs("days must be 1 to 90".into()))
+}
+
 impl Service {
     async fn changed(&self) {
         // Only fails when the daemon is shutting down.
@@ -183,15 +191,9 @@ impl Service {
         } else {
             Some(parse_id(id)?)
         };
-        let days = days
-            .trim()
-            .parse::<u32>()
-            .ok()
-            .filter(|d| (1..=90).contains(d))
-            .ok_or_else(|| fdo::Error::InvalidArgs("days must be 1 to 90".into()))?;
         self.shared
             .lock()
-            .doses_json(id, days, daemon::now())
+            .doses_json(id, parse_days(days)?, daemon::now())
             .map_err(|e| to_fdo(&e))
     }
 
@@ -202,8 +204,20 @@ impl Service {
     fn timeline(&self, date: &str) -> fdo::Result<String> {
         self.shared
             .lock()
-            .timeline_json(date)
+            .timeline_json(date, daemon::now())
             .map_err(fdo::Error::InvalidArgs)
+    }
+
+    /// Usage over the last `days` local days (1 to 90) and the same number
+    /// of days before them.
+    fn stats(&self, days: &str) -> fdo::Result<String> {
+        self.shared
+            .lock()
+            .stats_json(parse_days(days)?, daemon::now())
+            .map_err(|e| {
+                tracing::warn!("stats: {e:#}");
+                fdo::Error::Failed("stats unavailable".into())
+            })
     }
 
     /// Called by the `KWin` script on focus, caption and fullscreen changes.

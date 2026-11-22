@@ -16,7 +16,7 @@ pub enum Day {
 }
 
 impl Day {
-    fn matches(self, weekday: Weekday) -> bool {
+    pub(crate) fn matches(self, weekday: Weekday) -> bool {
         let w = match self {
             Day::Mon => Weekday::Monday,
             Day::Tue => Weekday::Tuesday,
