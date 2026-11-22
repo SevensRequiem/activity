@@ -24,7 +24,7 @@ pub const IDLE_PROBE_SECS: u32 = 60;
 const MAX_URL: usize = 2048;
 
 const KWIN_SCRIPT: &str = include_str!("../../../kwin/activity-tracker.js");
-const KWIN_PLUGIN: &str = "dev.requiem.activity-tracker";
+const KWIN_PLUGIN: &str = "io.github.sevensrequiem.activity-tracker";
 
 /// `KWin` is the only thing on Wayland that knows the active window, so we load
 /// a script into it that reports focus and caption changes back over D-Bus.

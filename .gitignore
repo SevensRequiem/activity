@@ -11,3 +11,11 @@
 /.vscode
 /.zprofile
 /.zshrc
+/CLAUDE.md
+/AGENTS.md
+/GEMINI.md
+/.cursor/
+/.aider*
+*.db
+*.db-wal
+*.db-shm

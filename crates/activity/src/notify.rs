@@ -55,7 +55,10 @@ pub async fn desktop(
     };
     let hints = HashMap::from([
         ("urgency", Value::U8(if urgent { 2 } else { 1 })),
-        ("desktop-entry", Value::from("dev.requiem.activity")),
+        (
+            "desktop-entry",
+            Value::from("io.github.sevensrequiem.activity"),
+        ),
     ]);
     let actions = [
         ACTION_DONE,
@@ -83,7 +86,10 @@ pub async fn desktop(
 
 /// Information only: no actions, and it expires like any other notification.
 pub async fn summary(proxy: &NotificationsProxy<'_>, title: &str, body: &str) -> Result<u32> {
-    let hints = HashMap::from([("desktop-entry", Value::from("dev.requiem.activity"))]);
+    let hints = HashMap::from([(
+        "desktop-entry",
+        Value::from("io.github.sevensrequiem.activity"),
+    )]);
     proxy
         .notify(
             "Activity",

@@ -1,6 +1,6 @@
 {
     "KPlugin": {
-        "Id": "dev.requiem.activity",
+        "Id": "io.github.sevensrequiem.activity",
         "Name": "Activity",
         "Description": "Activity-aware reminders",
         "Icon": "appointment-soon",

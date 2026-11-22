@@ -2,6 +2,6 @@
 Type=Application
 Name=Activity
 Comment=Activity-aware reminders
-Exec=plasmawindowed dev.requiem.activity
+Exec=plasmawindowed io.github.sevensrequiem.activity
 Icon=appointment-soon
 Categories=Utility;

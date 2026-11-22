@@ -345,7 +345,7 @@ mod tests {
             ),
             (
                 "ssh in konsole",
-                snap("org.kde.konsole", "req@box: ssh dev", false, false, 0),
+                snap("org.kde.konsole", "user@host: ssh dev", false, false, 0),
                 State::Focus,
             ),
             (

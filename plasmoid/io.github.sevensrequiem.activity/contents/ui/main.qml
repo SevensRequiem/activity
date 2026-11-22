@@ -44,9 +44,9 @@ PlasmoidItem {
 
     function call(member, args, done) {
         const reply = DBus.SessionBus.asyncCall({
-            service: "dev.requiem.Activity",
-            path: "/dev/requiem/Activity",
-            iface: "dev.requiem.Activity",
+            service: "io.github.sevensrequiem.Activity",
+            path: "/io/github/sevensrequiem/Activity",
+            iface: "io.github.sevensrequiem.Activity",
             member: member,
             arguments: args
         })

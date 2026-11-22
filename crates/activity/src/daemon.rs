@@ -604,7 +604,9 @@ async fn main_loop(
         )?
         .build()
         .await
-        .context("claiming dev.requiem.Activity on the session bus (already running?)")?;
+        .context(
+            "claiming io.github.sevensrequiem.Activity on the session bus (already running?)",
+        )?;
     let notifier = NotificationsProxy::new(&conn).await?;
 
     let spawn = |name: &'static str, fut: futures_lite::future::Boxed<Result<()>>| {

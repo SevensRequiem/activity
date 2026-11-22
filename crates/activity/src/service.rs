@@ -9,8 +9,8 @@ use zbus::fdo;
 use crate::daemon::{self, Event, MAX_CAPTION, Resolution, Shared};
 use crate::notify::NotificationsProxy;
 
-pub const NAME: &str = "dev.requiem.Activity";
-pub const PATH: &str = "/dev/requiem/Activity";
+pub const NAME: &str = "io.github.sevensrequiem.Activity";
+pub const PATH: &str = "/io/github/sevensrequiem/Activity";
 const MAX_JSON: usize = 16 * 1024;
 
 pub struct Service {
@@ -75,7 +75,7 @@ impl Service {
 }
 
 /// Payloads are JSON strings so the QML side needs no D-Bus type plumbing.
-#[zbus::interface(name = "dev.requiem.Activity")]
+#[zbus::interface(name = "io.github.sevensrequiem.Activity")]
 impl Service {
     fn list_reminders(&self) -> fdo::Result<String> {
         self.shared

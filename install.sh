@@ -5,12 +5,12 @@ cd "$(dirname "$0")"
 cargo build --release --locked
 install -Dm755 target/release/activity "$HOME/.local/bin/activity"
 install -Dm644 dist/activity.service "$HOME/.config/systemd/user/activity.service"
-install -Dm644 dist/dev.requiem.activity.desktop "$HOME/.local/share/applications/dev.requiem.activity.desktop"
+install -Dm644 dist/io.github.sevensrequiem.activity.desktop "$HOME/.local/share/applications/io.github.sevensrequiem.activity.desktop"
 
-if kpackagetool6 -t Plasma/Applet -s dev.requiem.activity >/dev/null 2>&1; then
-  kpackagetool6 -t Plasma/Applet -u plasmoid/dev.requiem.activity
+if kpackagetool6 -t Plasma/Applet -s io.github.sevensrequiem.activity >/dev/null 2>&1; then
+  kpackagetool6 -t Plasma/Applet -u plasmoid/io.github.sevensrequiem.activity
 else
-  kpackagetool6 -t Plasma/Applet -i plasmoid/dev.requiem.activity
+  kpackagetool6 -t Plasma/Applet -i plasmoid/io.github.sevensrequiem.activity
 fi
 
 systemctl --user daemon-reload

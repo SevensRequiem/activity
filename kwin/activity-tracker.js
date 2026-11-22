@@ -1,5 +1,5 @@
-const service = "dev.requiem.Activity";
-const path = "/dev/requiem/Activity";
+const service = "io.github.sevensrequiem.Activity";
+const path = "/io/github/sevensrequiem/Activity";
 let current = null;
 
 function report() {
