@@ -25,6 +25,12 @@ PC3.ScrollView {
 
     function hm(t) { return String(t).slice(0, 5) }
 
+    function parseDur(t, fallback) {
+        const m = String(t).trim().toLowerCase().match(/^(?:(\d+(?:\.\d+)?)\s*h)?\s*(?:(\d+)\s*m?)?$/)
+        if (!m || (m[1] === undefined && m[2] === undefined)) return fallback
+        return Math.round(parseFloat(m[1] || 0) * 60) + parseInt(m[2] || 0)
+    }
+
     function load(entry) {
         status = ""
         const r = entry ? entry.reminder : null
@@ -150,21 +156,30 @@ PC3.ScrollView {
             visible: kind.currentIndex === 3
             Kirigami.FormData.label: "Every:"
             from: 15; to: 1440; stepSize: 15
+            Layout.preferredWidth: Kirigami.Units.gridUnit * 9
+            validator: RegularExpressionValidator { regularExpression: /[0-9hmHM. ]*/ }
             textFromValue: (v, l) => editor.app.dur(v)
+            valueFromText: (t, l) => editor.parseDur(t, doseEvery.value)
         }
         PC3.SpinBox {
             id: doseGap
             visible: kind.currentIndex === 3
             Kirigami.FormData.label: "Never closer than:"
             from: 0; to: doseEvery.value; stepSize: 15
+            Layout.preferredWidth: Kirigami.Units.gridUnit * 9
+            validator: RegularExpressionValidator { regularExpression: /[0-9hmHM. ]*/ }
             textFromValue: (v, l) => editor.app.dur(v)
+            valueFromText: (t, l) => editor.parseDur(t, doseGap.value)
         }
         PC3.SpinBox {
             id: doseMax
             visible: kind.currentIndex === 3
             Kirigami.FormData.label: "Max per 24 hours:"
             from: 0; to: 48
+            Layout.preferredWidth: Kirigami.Units.gridUnit * 9
+            validator: RegularExpressionValidator { regularExpression: /[0-9]*|no cap/ }
             textFromValue: (v, l) => v === 0 ? "no cap" : String(v)
+            valueFromText: (t, l) => /^\d+$/.test(t.trim()) ? parseInt(t) : 0
         }
         PC3.Label {
             visible: kind.currentIndex === 3
